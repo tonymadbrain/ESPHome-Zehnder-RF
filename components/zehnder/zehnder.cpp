@@ -2,12 +2,25 @@
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 
+#include <cstdio>
+#include <string>
+
 namespace esphome {
 namespace zehnder {
 
 #define MAX_TRANSMIT_TIME 2000
 
 static const char *const TAG = "zehnder";
+
+static std::string buffer_to_hex(const uint8_t *data, const size_t len) {
+  char buf[512];
+  size_t idx = 0;
+
+  for (size_t i = 0; i < len && idx + 4 < sizeof(buf); i++) {
+    idx += snprintf(&buf[idx], sizeof(buf) - idx, (i == 0 ? "0x%02X" : " 0x%02X"), data[i]);
+  }
+  return std::string(buf, idx);
+}
 
 typedef struct __attribute__((packed)) {
   uint32_t networkId;
@@ -61,6 +74,11 @@ ZehnderRF::ZehnderRF(void) {}
 fan::FanTraits ZehnderRF::get_traits() { return fan::FanTraits(false, true, false, this->speed_count_); }
 
 void ZehnderRF::control(const fan::FanCall &call) {
+  if (this->sniffing_) {
+    ESP_LOGW(TAG, "Ignoring control while sniffing");
+    return;
+  }
+
   if (call.get_state().has_value()) {
     this->state = *call.get_state();
     ESP_LOGD(TAG, "Control has state: %u", this->state);
@@ -163,6 +181,20 @@ void ZehnderRF::loop(void) {
   uint8_t deviceId;
   nrf905::Config rfConfig;
 
+  if (this->sniffing_) {
+    // millis wrap safe: event passed if now - end is a "small" positive number
+    if ((uint32_t)(millis() - this->sniff_end_time_) < 0x80000000UL) {
+      ESP_LOGI(TAG, "Sniff window elapsed, restoring configuration");
+      this->rfComplete();
+      this->rf_->updateConfig(&this->sniff_saved_config_);
+      this->rf_->writeTxAddress(this->sniff_saved_config_.rx_address);
+      this->state_ = this->sniff_saved_state_;
+      this->sniffing_ = false;
+      this->lastFanQuery_ = millis();
+    }
+    return;  // Stay in sniff mode until window closes
+  }
+
   // Run RF handler
   this->rfHandler();
 
@@ -223,6 +255,11 @@ void ZehnderRF::rfHandleReceived(const uint8_t *const pData, const uint8_t dataL
   const RfFrame *const pResponse = (RfFrame *) pData;
   RfFrame *const pTxFrame = (RfFrame *) this->_txFrame;  // frame helper
   nrf905::Config rfConfig;
+
+  if (this->sniffing_) {
+    ESP_LOGI(TAG, "Sniff RX len=%u: %s", dataLength, buffer_to_hex(pData, dataLength).c_str());
+    return;
+  }
 
   ESP_LOGD(TAG, "Current state: 0x%02X", this->state_);
   switch (this->state_) {
@@ -526,6 +563,30 @@ void ZehnderRF::setSpeed(const uint8_t paramSpeed, const uint8_t paramTimer) {
     newTimer = timer;
     newSetting = true;
   }
+}
+
+void ZehnderRF::startSniffing(const uint32_t duration_ms) {
+  if (this->sniffing_) {
+    ESP_LOGW(TAG, "Already sniffing");
+    return;
+  }
+
+  this->sniff_saved_config_ = this->rf_->getConfig();
+  this->sniff_saved_state_ = this->state_;
+  this->rfComplete();
+  this->rfState_ = RfStateIdle;
+  this->state_ = StateIdle;
+
+  nrf905::Config cfg = this->sniff_saved_config_;
+  cfg.rx_address = NETWORK_DEFAULT_ID;  // Default/broadcast network id
+  cfg.channel = 0;                      // Default channel 0
+  this->rf_->updateConfig(&cfg);
+  this->rf_->writeTxAddress(cfg.rx_address);
+
+  this->sniff_end_time_ = millis() + duration_ms;
+  this->sniffing_ = true;
+
+  ESP_LOGI(TAG, "Entering sniff mode for %u ms on addr 0x%08X channel %u", duration_ms, cfg.rx_address, cfg.channel);
 }
 
 void ZehnderRF::discoveryStart(const uint8_t deviceId) {
