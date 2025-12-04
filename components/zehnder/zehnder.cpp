@@ -578,10 +578,12 @@ void ZehnderRF::startSniffing(const uint32_t duration_ms) {
   this->state_ = StateIdle;
 
   nrf905::Config cfg = this->sniff_saved_config_;
-  cfg.rx_address = NETWORK_DEFAULT_ID;  // Default/broadcast network id
-  cfg.channel = 0;                      // Default channel 0
+  // Listen on the known link/pairing address and channel used during discovery
+  cfg.rx_address = NETWORK_LINK_ID;
+  cfg.channel = 118;
   this->rf_->updateConfig(&cfg);
   this->rf_->writeTxAddress(cfg.rx_address);
+  this->rf_->setMode(nrf905::Receive);
 
   this->sniff_end_time_ = millis() + duration_ms;
   this->sniffing_ = true;
